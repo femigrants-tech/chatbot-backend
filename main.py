@@ -39,23 +39,28 @@ PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "femigrants-rag-chatbot")
 PINECONE_ASSISTANT_NAME = os.getenv("PINECONE_ASSISTANT_NAME", "femigrants-assistant")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not PINECONE_API_KEY:
-    raise ValueError("PINECONE_API_KEY environment variable is not set")
+# Initialize clients (lazy - don't crash at import time for serverless compatibility)
+pc = None
+llm = None
 
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY environment variable is not set")
-
-pc = Pinecone(api_key=PINECONE_API_KEY)
-
-# Configure Google Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-
-# Initialize LangChain with Gemini
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    google_api_key=GEMINI_API_KEY,
-    temperature=0.7,
-)
+if PINECONE_API_KEY and GEMINI_API_KEY:
+    try:
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        genai.configure(api_key=GEMINI_API_KEY)
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            google_api_key=GEMINI_API_KEY,
+            temperature=0.7,
+        )
+    except Exception as e:
+        print(f"Warning: Failed to initialize clients: {e}")
+else:
+    missing = []
+    if not PINECONE_API_KEY:
+        missing.append("PINECONE_API_KEY")
+    if not GEMINI_API_KEY:
+        missing.append("GEMINI_API_KEY")
+    print(f"Warning: Missing environment variables: {', '.join(missing)}")
 
 
 # Pydantic models for request/response
@@ -255,6 +260,12 @@ async def chat(request: ChatRequest):
     }
     """
     try:
+        if not pc or not llm:
+            raise HTTPException(
+                status_code=503,
+                detail="Backend services not initialized. Check that PINECONE_API_KEY and GEMINI_API_KEY environment variables are set."
+            )
+        
         print(f"\n{'='*80}")
         print(f"CHAT REQUEST: {request.message}")
         print(f"{'='*80}")
