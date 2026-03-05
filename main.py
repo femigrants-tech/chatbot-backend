@@ -6,10 +6,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from pinecone import Pinecone
-import google.generativeai as genai
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import HumanMessage, AIMessage
+from google import genai
 import tempfile
 import shutil
 
@@ -41,17 +38,12 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Initialize clients (lazy - don't crash at import time for serverless compatibility)
 pc = None
-llm = None
+gemini_client = None
 
 if PINECONE_API_KEY and GEMINI_API_KEY:
     try:
         pc = Pinecone(api_key=PINECONE_API_KEY)
-        genai.configure(api_key=GEMINI_API_KEY)
-        llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
-            google_api_key=GEMINI_API_KEY,
-            temperature=0.7,
-        )
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
     except Exception as e:
         print(f"Warning: Failed to initialize clients: {e}")
 else:
@@ -227,16 +219,16 @@ def get_context_from_pinecone(query: str, filter_metadata: Optional[Dict] = None
         return []
 
 
-# Helper function to format chat history for LangChain
+# Helper function to format chat history for Gemini
 def format_chat_history(chat_context: List[ChatMessage]):
-    """Convert chat context to LangChain message format"""
-    messages = []
+    """Convert chat context to Gemini content format"""
+    contents = []
     for msg in chat_context:
         if msg.role == "user":
-            messages.append(HumanMessage(content=msg.content))
+            contents.append({"role": "user", "parts": [{"text": msg.content}]})
         elif msg.role == "assistant":
-            messages.append(AIMessage(content=msg.content))
-    return messages
+            contents.append({"role": "model", "parts": [{"text": msg.content}]})
+    return contents
 
 
 @app.get("/")
@@ -260,7 +252,7 @@ async def chat(request: ChatRequest):
     }
     """
     try:
-        if not pc or not llm:
+        if not pc or not gemini_client:
             raise HTTPException(
                 status_code=503,
                 detail="Backend services not initialized. Check that PINECONE_API_KEY and GEMINI_API_KEY environment variables are set."
@@ -286,9 +278,8 @@ async def chat(request: ChatRequest):
             context_text = ""
             print("\nWARNING: No context retrieved from Pinecone!")
         
-        # Create improved prompt template with chat history
-        prompt_template = ChatPromptTemplate.from_messages([
-            ("system", """You are a knowledgeable and helpful AI assistant for the Femigrants Foundation. You have access to a comprehensive internal knowledge base. Your primary task is to deliver **accurate, detailed, and context-based answers** using the information provided below.
+        # Build the system instruction
+        system_instruction = """You are a knowledgeable and helpful AI assistant for the Femigrants Foundation. You have access to a comprehensive internal knowledge base. Your primary task is to deliver **accurate, detailed, and context-based answers** using the information provided below.
 
 ### IMPORTANT INSTRUCTIONS
 
@@ -349,33 +340,33 @@ async def chat(request: ChatRequest):
 ---
 
 ### CONTEXT FROM KNOWLEDGE BASE:
-{context}
-
-"""),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("human", "{question}")
-        ])
+""" + (context_text if context_text else "⚠️ No relevant context found in the knowledge base. Please inform the user that you don't have specific information about this topic in the knowledge base.")
         
-        # Format chat history
+        # Format chat history for Gemini
         chat_history = format_chat_history(request.chat_context or [])
         
-        # Create the prompt
-        formatted_prompt = prompt_template.format_messages(
-            context=context_text if context_text else "⚠️ No relevant context found in the knowledge base. Please inform the user that you don't have specific information about this topic in the knowledge base.",
-            chat_history=chat_history,
-            question=request.message
-        )
+        # Build the contents list: chat history + current question
+        contents = chat_history + [{"role": "user", "parts": [{"text": request.message}]}]
         
         print(f"\nPrompt created. Sending to Gemini (model: gemini-2.5-flash)...")
         
-        # Get response from Gemini
-        response = llm.invoke(formatted_prompt)
+        # Get response from Gemini using google-genai SDK
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=contents,
+            config={
+                "system_instruction": system_instruction,
+                "temperature": 0.7,
+            }
+        )
         
-        print(f"Response received: {response.content[:200]}...")
+        response_text = response.text
+        
+        print(f"Response received: {response_text[:200]}...")
         print(f"{'='*80}\n")
         
         return ChatResponse(
-            response=response.content,
+            response=response_text,
             context_used=context_items
         )
         
