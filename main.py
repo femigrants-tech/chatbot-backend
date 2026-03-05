@@ -19,10 +19,15 @@ load_dotenv()
 # Initialize FastAPI app
 app = FastAPI(title="RAG Backend with Pinecone Assistant")
 
-# Configure CORS
+# Configure CORS - allow production frontend URLs and all Vercel preview deployments
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "https://femigrants-chatbot-frontend.vercel.app",
+    ],
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
