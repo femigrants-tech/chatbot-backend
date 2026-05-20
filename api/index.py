@@ -128,6 +128,21 @@ def get_assistant():
         )
 
 
+def _to_json_serializable(value: Any) -> Any:
+    """Convert Pinecone SDK objects to JSON-serializable plain types."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {k: _to_json_serializable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_json_serializable(v) for v in value]
+    if hasattr(value, "model_dump"):
+        return _to_json_serializable(value.model_dump())
+    if hasattr(value, "to_dict"):
+        return _to_json_serializable(value.to_dict())
+    return str(value)
+
+
 def _extract_snippets(context_response: Any) -> List[Any]:
     if context_response is None:
         return []
@@ -179,10 +194,15 @@ def _snippet_to_context_item(snippet: Any) -> Optional[Dict[str, Any]]:
     return {
         "text": text,
         "score": score,
-        "metadata": {"file_name": file_name, "file_id": file_id, "pages": pages, "signed_url": signed_url},
+        "metadata": {
+            "file_name": file_name,
+            "file_id": file_id,
+            "pages": _to_json_serializable(pages),
+            "signed_url": signed_url,
+        },
         "file_id": file_id,
         "signed_url": signed_url,
-        "reference": reference,
+        "reference": _to_json_serializable(reference) if reference else None,
     }
 
 
