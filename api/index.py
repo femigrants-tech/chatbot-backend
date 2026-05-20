@@ -23,6 +23,8 @@ app.add_middleware(
         "http://localhost:3000",
         "http://localhost:5173",
         "https://femigrants-chatbot-frontend.vercel.app",
+        "https://femigrants.com",
+        "https://www.femigrants.com",
     ],
     allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
