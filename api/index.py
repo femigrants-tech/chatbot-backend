@@ -81,71 +81,128 @@ class UpdateMetadataRequest(BaseModel):
     metadata: Dict[str, Any]
 
 
-# Helper: get or create Pinecone assistant
+# Cached assistant handle (reused across warm serverless invocations)
+_assistant_handle = None
+
+
 def get_assistant():
+    """Return the Pinecone assistant, creating it only if it does not exist."""
+    global _assistant_handle
+    if _assistant_handle is not None:
+        return _assistant_handle
+
+    name = PINECONE_ASSISTANT_NAME
+    last_error = None
+
+    def _load_existing():
+        for loader in (
+            lambda: pc.assistant.describe_assistant(assistant_name=name),
+            lambda: pc.assistant.Assistant(assistant_name=name),
+        ):
+            try:
+                return loader()
+            except Exception as e:
+                nonlocal last_error
+                last_error = e
+        return None
+
+    assistant = _load_existing()
+    if assistant is not None:
+        _assistant_handle = assistant
+        return assistant
+
     try:
-        return pc.assistant.Assistant(assistant_name=PINECONE_ASSISTANT_NAME)
-    except Exception:
-        try:
-            return pc.assistant.create_assistant(assistant_name=PINECONE_ASSISTANT_NAME)
-        except Exception as create_error:
-            raise HTTPException(status_code=500, detail=f"Failed to get or create assistant: {str(create_error)}")
+        assistant = pc.assistant.create_assistant(assistant_name=name)
+        _assistant_handle = assistant
+        return assistant
+    except Exception as create_error:
+        err_str = str(create_error)
+        if "ALREADY_EXISTS" in err_str or "409" in err_str:
+            assistant = _load_existing()
+            if assistant is not None:
+                _assistant_handle = assistant
+                return assistant
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get or create assistant: {err_str or last_error}",
+        )
+
+
+def _extract_snippets(context_response: Any) -> List[Any]:
+    if context_response is None:
+        return []
+    if isinstance(context_response, dict):
+        raw = context_response.get("snippets", [])
+    elif hasattr(context_response, "snippets"):
+        raw = context_response.snippets
+    elif hasattr(context_response, "model_dump"):
+        raw = context_response.model_dump().get("snippets", [])
+    elif hasattr(context_response, "to_dict"):
+        raw = context_response.to_dict().get("snippets", [])
+    else:
+        return []
+    if not raw:
+        return []
+    return list(raw)
+
+
+def _snippet_to_context_item(snippet: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(snippet, dict):
+        text = snippet.get("content") or snippet.get("text") or ""
+        score = snippet.get("score")
+        reference = snippet.get("reference", {})
+    else:
+        text = getattr(snippet, "content", None) or getattr(snippet, "text", None) or ""
+        score = getattr(snippet, "score", None)
+        reference = getattr(snippet, "reference", {})
+
+    text = (text or "").strip()
+    if not text:
+        return None
+
+    if isinstance(reference, dict):
+        file_info = reference.get("file", {})
+        pages = reference.get("pages", [])
+    else:
+        file_info = getattr(reference, "file", {})
+        pages = getattr(reference, "pages", [])
+
+    if isinstance(file_info, dict):
+        file_name = file_info.get("name", "Unknown")
+        file_id = file_info.get("id")
+        signed_url = file_info.get("signed_url")
+    else:
+        file_name = getattr(file_info, "name", "Unknown")
+        file_id = getattr(file_info, "id", None)
+        signed_url = getattr(file_info, "signed_url", None)
+
+    return {
+        "text": text,
+        "score": score,
+        "metadata": {"file_name": file_name, "file_id": file_id, "pages": pages, "signed_url": signed_url},
+        "file_id": file_id,
+        "signed_url": signed_url,
+        "reference": reference,
+    }
 
 
 # Helper: query Pinecone for context
 def get_context_from_pinecone(query: str, filter_metadata: Optional[Dict] = None, top_k: int = 10) -> List[Dict[str, Any]]:
     try:
         assistant = get_assistant()
-        context_response = assistant.context(query=query, filter=filter_metadata)
+        context_response = assistant.context(query=query, filter=filter_metadata, top_k=top_k)
         context_items = []
-        snippets = None
-
-        if hasattr(context_response, 'snippets'):
-            snippets = context_response.snippets
-        elif hasattr(context_response, 'to_dict'):
-            snippets = context_response.to_dict().get('snippets', [])
-        elif isinstance(context_response, dict):
-            snippets = context_response.get('snippets', [])
-
-        if snippets:
-            for snippet in snippets[:top_k]:
-                if isinstance(snippet, dict):
-                    text = snippet.get('content', '')
-                    score = snippet.get('score', None)
-                    reference = snippet.get('reference', {})
-                else:
-                    text = snippet.content if hasattr(snippet, 'content') else str(snippet)
-                    score = snippet.score if hasattr(snippet, 'score') else None
-                    reference = snippet.reference if hasattr(snippet, 'reference') else {}
-
-                if isinstance(reference, dict):
-                    file_info = reference.get('file', {})
-                    pages = reference.get('pages', [])
-                else:
-                    file_info = reference.file if hasattr(reference, 'file') else {}
-                    pages = reference.pages if hasattr(reference, 'pages') else []
-
-                if isinstance(file_info, dict):
-                    file_name = file_info.get('name', 'Unknown')
-                    file_id = file_info.get('id', None)
-                    signed_url = file_info.get('signed_url', None)
-                else:
-                    file_name = file_info.name if hasattr(file_info, 'name') else 'Unknown'
-                    file_id = file_info.id if hasattr(file_info, 'id') else None
-                    signed_url = file_info.signed_url if hasattr(file_info, 'signed_url') else None
-
-                context_items.append({
-                    'text': text,
-                    'score': score,
-                    'metadata': {'file_name': file_name, 'file_id': file_id, 'pages': pages, 'signed_url': signed_url},
-                    'file_id': file_id,
-                    'signed_url': signed_url,
-                    'reference': reference
-                })
-
+        for snippet in _extract_snippets(context_response)[:top_k]:
+            item = _snippet_to_context_item(snippet)
+            if item:
+                context_items.append(item)
         return context_items
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error querying Pinecone: {e}")
+        import traceback
+        traceback.print_exc()
         return []
 
 
@@ -174,8 +231,9 @@ SYSTEM_PROMPT = """You are a knowledgeable and helpful AI assistant for the Femi
    - Provide detailed, specific, and factual responses.
 
 3. **Out-of-Context Questions**
-   - If the user asks about something **not covered in the context** or **unrelated to Femigrants Foundation**, respond with:
-     "I'm sorry, but I don't have information about that in my knowledge base. For assistance with questions outside my scope, please contact Femigrants directly at contact@femigrants.com"
+   - Use this response **only** when the context below contains real source excerpts but they do not answer the question, or the question is clearly unrelated to Femigrants Foundation.
+   - If the context says no snippets were retrieved, say the knowledge base could not be searched right now and suggest contact@femigrants.com — do **not** use the standard "I don't have information" reply in that case.
+   - Standard out-of-scope reply: "I'm sorry, but I don't have information about that in my knowledge base. For assistance with questions outside my scope, please contact Femigrants directly at contact@femigrants.com"
    - Then end with the mandatory closing line.
 
 4. **Sensitive or Risky Topics - CRITICAL SAFETY RULES**
@@ -226,7 +284,7 @@ async def chat(request: ChatRequest):
         context_text = "\n\n---\n\n".join([
             f"Source {i+1} (Relevance: {item.get('score', 'N/A')}):\n{item['text']}"
             for i, item in enumerate(context_items)
-        ]) if context_items else "⚠️ No relevant context found in the knowledge base."
+        ]) if context_items else "⚠️ No context snippets were retrieved from Pinecone for this query (retrieval may have failed)."
 
         system_instruction = SYSTEM_PROMPT.format(context=context_text)
         chat_history = format_chat_history(request.chat_context or [])
