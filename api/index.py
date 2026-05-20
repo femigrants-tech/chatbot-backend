@@ -311,7 +311,7 @@ async def chat(request: ChatRequest):
         contents = chat_history + [{"role": "user", "parts": [{"text": request.message}]}]
 
         response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-2.5-flash-lite",
             contents=contents,
             config={
                 "system_instruction": system_instruction,
